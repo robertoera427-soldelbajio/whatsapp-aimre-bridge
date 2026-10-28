@@ -21,6 +21,8 @@ import {
   onSnapshot,
   updateDoc,
   serverTimestamp,
+  getDocs,
+  limit,
 } from 'firebase/firestore';
 
 import {
@@ -215,14 +217,91 @@ async function startWhatsAppBridge() {
 
       syncLocalSessionToFirestore(db, 'auth_session');
       await updateFirestoreState('conectado', connectedPhoneNumber);
+
+      // Despachar inmediatamente mensajes encolados mientras estaba desconectado
+      setTimeout(() => {
+        procesarColaPendiente();
+      }, 2000);
     }
   });
 
   listenOutgoingQueue();
 }
 
-// 4. Escuchar cola de salida de mensajes en Firestore
 let listenerActivo = false;
+let procesandoCola = false;
+
+async function despacharItem(docId: string, item: any): Promise<boolean> {
+  if (!sock || connectionState !== 'conectado') return false;
+  try {
+    const targetJid = formatWhatsAppJid(item.jid || item.telefono || '');
+    console.log(`📤 [Enviando WhatsApp] Hacia ${targetJid} (Doc: ${docId})...`);
+    await sock.sendMessage(targetJid, { text: item.texto });
+
+    await updateDoc(doc(db, 'cola_salida_whatsapp', docId), {
+      estado: 'enviado',
+      fechaEnvio: serverTimestamp(),
+    });
+    console.log(`✅ [Enviado exitosamente a WhatsApp] Doc: ${docId}`);
+    return true;
+  } catch (err: any) {
+    console.error(`❌ [Error enviando a WhatsApp con primary JID]:`, err.message);
+    try {
+      const digits = (item.telefono || '').replace(/\D/g, '');
+      const altJid = digits.length === 10
+        ? `521${digits}@s.whatsapp.net`
+        : (digits.startsWith('52') && digits.length === 12
+          ? `521${digits.substring(2)}@s.whatsapp.net`
+          : `${digits}@s.whatsapp.net`);
+
+      console.log(`🔄 [Reintentando con fallback JID]: ${altJid}...`);
+      await sock.sendMessage(altJid, { text: item.texto });
+
+      await updateDoc(doc(db, 'cola_salida_whatsapp', docId), {
+        estado: 'enviado',
+        fechaEnvio: serverTimestamp(),
+        nota: `Enviado con fallback ${altJid}`
+      });
+      console.log(`✅ [Fallback exitoso a WhatsApp] Doc: ${docId}`);
+      return true;
+    } catch (err2: any) {
+      console.error(`❌ [Fallback también falló]:`, err2.message);
+      await updateDoc(doc(db, 'cola_salida_whatsapp', docId), {
+        estado: 'error',
+        error: err.message,
+      });
+      return false;
+    }
+  }
+}
+
+export async function procesarColaPendiente() {
+  if (procesandoCola) return;
+  if (!sock || connectionState !== 'conectado') return;
+
+  procesandoCola = true;
+  try {
+    const q = query(
+      collection(db, 'cola_salida_whatsapp'),
+      where('estado', '==', 'pendiente'),
+      limit(25)
+    );
+    const snap = await getDocs(q);
+    if (!snap.empty) {
+      console.log(`📬 [Cola Salida] Despachando ${snap.size} mensaje(s) pendiente(s)...`);
+      for (const docSnap of snap.docs) {
+        if (!sock || connectionState !== 'conectado') break;
+        await despacharItem(docSnap.id, docSnap.data());
+      }
+    }
+  } catch (e: any) {
+    console.error('⚠️ [Cola] Error al procesar mensajes pendientes:', e?.message || e);
+  } finally {
+    procesandoCola = false;
+  }
+}
+
+// 4. Escuchar cola de salida de mensajes en Firestore
 function listenOutgoingQueue() {
   if (listenerActivo) return;
   listenerActivo = true;
@@ -231,64 +310,36 @@ function listenOutgoingQueue() {
 
   const q = query(
     collection(db, 'cola_salida_whatsapp'),
-    where('estado', '==', 'pendiente')
+    where('estado', '==', 'pendiente'),
+    limit(25)
   );
 
   onSnapshot(q, async (snapshot) => {
+    if (snapshot.empty) return;
+    if (!sock || connectionState !== 'conectado') {
+      console.log(`⏳ [Cola Salida] ${snapshot.size} mensaje(s) pendiente(s). Esperando conexión de WhatsApp...`);
+      return;
+    }
     for (const change of snapshot.docChanges()) {
-      if (change.type === 'added') {
+      if (change.type === 'added' || change.type === 'modified') {
         const item = change.doc.data();
-        const docId = change.doc.id;
-
-        console.log(`📥 [Cola Salida] Mensaje pendiente detectado para ${item.telefono}`);
-
-        if (!sock || connectionState !== 'conectado') {
-          console.log(`⏳ [Cola Salida] WhatsApp aún no está listo. Pendiente...`);
-          continue;
-        }
-
-        try {
-          const targetJid = formatWhatsAppJid(item.jid || item.telefono || '');
-          console.log(`📤 [Enviando WhatsApp] Hacia ${targetJid}...`);
-          await sock.sendMessage(targetJid, { text: item.texto });
-
-          await updateDoc(doc(db, 'cola_salida_whatsapp', docId), {
-            estado: 'enviado',
-            fechaEnvio: serverTimestamp(),
-          });
-          console.log(`✅ [Enviado exitosamente a WhatsApp] Doc: ${docId}`);
-        } catch (err: any) {
-          console.error(`❌ [Error enviando a WhatsApp con primary JID]:`, err.message);
-          try {
-            const digits = (item.telefono || '').replace(/\D/g, '');
-            const altJid = digits.length === 10
-              ? `521${digits}@s.whatsapp.net`
-              : (digits.startsWith('52') && digits.length === 12
-                ? `521${digits.substring(2)}@s.whatsapp.net`
-                : `${digits}@s.whatsapp.net`);
-
-            console.log(`🔄 [Reintentando con fallback JID]: ${altJid}...`);
-            await sock.sendMessage(altJid, { text: item.texto });
-
-            await updateDoc(doc(db, 'cola_salida_whatsapp', docId), {
-              estado: 'enviado',
-              fechaEnvio: serverTimestamp(),
-              nota: `Enviado con fallback ${altJid}`
-            });
-            console.log(`✅ [Fallback exitoso a WhatsApp] Doc: ${docId}`);
-          } catch (err2: any) {
-            console.error(`❌ [Fallback también falló]:`, err2.message);
-            await updateDoc(doc(db, 'cola_salida_whatsapp', docId), {
-              estado: 'error',
-              error: err.message,
-            });
-          }
+        if (item.estado === 'pendiente') {
+          await despacharItem(change.doc.id, item);
         }
       }
     }
   }, (err) => {
     console.error('❌ Error en el listener de cola_salida_whatsapp:', err.message);
+    listenerActivo = false;
+    setTimeout(listenOutgoingQueue, 5000);
   });
+
+  // Barrido periódico cada 30 segundos
+  setInterval(() => {
+    if (sock && connectionState === 'conectado') {
+      procesarColaPendiente();
+    }
+  }, 30000);
 }
 
 // 5. Interfaz Web para escanear el QR
